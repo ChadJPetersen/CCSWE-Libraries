@@ -10,6 +10,13 @@ using System.Threading;
 
 namespace CCSWE.Collections.ObjectModel
 {
+    /// <summary>
+    /// the event that handles adding new items to the collection
+    /// </summary>
+    /// <param name="source">The source of the event.</param>
+    /// <param name="e">The event arguments object.</param>
+    public delegate void addIntoEventHandler(object source, AddIntoEvent e);
+
     //TODO: SynchronizedObservableCollection<T> - Add xmldoc
     //TODO: SynchronizedObservableCollection<T> - ObservableCollection<T>.Move() is not implemented...
     [Serializable]
@@ -17,13 +24,31 @@ namespace CCSWE.Collections.ObjectModel
     [DebuggerDisplay("Count = {Count}")]
     public class SynchronizedObservableCollection<T> : IDisposable, IList<T>, IList, IReadOnlyList<T>, INotifyCollectionChanged, INotifyPropertyChanged
     {
-        #region Constructor
+        public event addIntoEventHandler addedToEvent;
+        #region Private Fields
+
+        private readonly SynchronizationContext _context;
+
+        private readonly IList<T> _items = new List<T>();
+
+        private readonly ReaderWriterLockSlim _itemsLocker = new ReaderWriterLockSlim();
+
+        private readonly SimpleMonitor _monitor = new SimpleMonitor();
+
+        [NonSerialized]
+        private Object _syncRoot;
+
+        #endregion Private Fields
+
+        #region Public Constructors
+
         public SynchronizedObservableCollection()
         {
             _context = SynchronizationContext.Current;
         }
 
-        public SynchronizedObservableCollection(IEnumerable<T> collection): this()
+        public SynchronizedObservableCollection(IEnumerable<T> collection)
+            : this()
         {
             if (collection == null)
             {
@@ -35,13 +60,14 @@ namespace CCSWE.Collections.ObjectModel
                 _items.Add(item);
             }
         }
-        
+
         public SynchronizedObservableCollection(SynchronizationContext context)
         {
             _context = context;
         }
 
-        public SynchronizedObservableCollection(IEnumerable<T> collection, SynchronizationContext context): this(context)
+        public SynchronizedObservableCollection(IEnumerable<T> collection, SynchronizationContext context)
+            : this(context)
         {
             if (collection == null)
             {
@@ -53,51 +79,44 @@ namespace CCSWE.Collections.ObjectModel
                 _items.Add(item);
             }
         }
-        #endregion
 
-        #region Private Fields
-        private readonly SynchronizationContext _context;
-        private readonly IList<T> _items = new List<T>();
-        private readonly ReaderWriterLockSlim _itemsLocker = new ReaderWriterLockSlim();
-        [NonSerialized] private Object _syncRoot;
+        #endregion Public Constructors
 
-        private readonly SimpleMonitor _monitor = new SimpleMonitor();
-        #endregion
+        #region Public Events
 
-        #region Events
+        public event NotifyCollectionChangedEventHandler CollectionChanged;
+
         event PropertyChangedEventHandler INotifyPropertyChanged.PropertyChanged
         {
             add { PropertyChanged += value; }
             remove { PropertyChanged -= value; }
         }
 
-        public event NotifyCollectionChangedEventHandler CollectionChanged;
-        protected event PropertyChangedEventHandler PropertyChanged;
-        #endregion
+        #endregion Public Events
 
-        #region Private Properties
-        bool IList.IsFixedSize
+        #region Protected Events
+
+        protected event PropertyChangedEventHandler PropertyChanged;
+
+        #endregion Protected Events
+
+        #region Public Properties
+
+        public int Count
         {
             get
             {
-                var list = _items as IList;
-                if (list != null)
+                _itemsLocker.EnterReadLock();
+
+                try
                 {
-                    return list.IsFixedSize;
+                    return _items.Count;
                 }
-
-                return _items.IsReadOnly;
+                finally
+                {
+                    _itemsLocker.ExitReadLock();
+                }
             }
-        }
-
-        bool ICollection<T>.IsReadOnly
-        {
-            get { return _items.IsReadOnly; }
-        }
-
-        bool IList.IsReadOnly
-        {
-            get { return _items.IsReadOnly; }
         }
 
         bool ICollection.IsSynchronized
@@ -134,22 +153,47 @@ namespace CCSWE.Collections.ObjectModel
                 return _syncRoot;
             }
         }
-        #endregion
 
-        #region Public Properties
-        public int Count
+        bool ICollection<T>.IsReadOnly
+        {
+            get { return _items.IsReadOnly; }
+        }
+
+        bool IList.IsFixedSize
         {
             get
             {
-                _itemsLocker.EnterReadLock();
+                var list = _items as IList;
+                if (list != null)
+                {
+                    return list.IsFixedSize;
+                }
 
+                return _items.IsReadOnly;
+            }
+        }
+
+        bool IList.IsReadOnly
+        {
+            get { return _items.IsReadOnly; }
+        }
+
+        #endregion Public Properties
+
+        #region Public Indexers
+
+        object IList.this[int index]
+        {
+            get { return this[index]; }
+            set
+            {
                 try
                 {
-                    return _items.Count;
+                    this[index] = (T)value;
                 }
-                finally
+                catch (InvalidCastException)
                 {
-                    _itemsLocker.ExitReadLock();
+                    throw new ArgumentException("'value' is the wrong type");
                 }
             }
         }
@@ -186,7 +230,6 @@ namespace CCSWE.Collections.ObjectModel
                     oldValue = this[index];
 
                     _items[index] = value;
-
                 }
                 finally
                 {
@@ -198,25 +241,426 @@ namespace CCSWE.Collections.ObjectModel
             }
         }
 
-        object IList.this[int index]
+        #endregion Public Indexers
+
+        #region Public Methods
+
+        public void Add(T item)
         {
-            get { return this[index]; }
-            set
+            _itemsLocker.EnterWriteLock();
+
+            var index = -1;
+
+            try
             {
-                try
-                {
-                    this[index] = (T) value;
-                }
-                catch (InvalidCastException)
-                {
-                    throw new ArgumentException("'value' is the wrong type");
-                }
+                CheckIsReadOnly();
+                CheckReentrancy();
+
+                index = _items.Count;
+
+                _items.Insert(index, item);
+            }
+            finally
+            {
+                _itemsLocker.ExitWriteLock();
+            }
+
+            OnPropertyChanged("Count");
+            OnPropertyChanged("Item[]");
+            OnCollectionChanged(NotifyCollectionChangedAction.Add, item, index);
+        }
+
+        public void Clear()
+        {
+            _itemsLocker.EnterWriteLock();
+
+            try
+            {
+                CheckIsReadOnly();
+                CheckReentrancy();
+
+                _items.Clear();
+            }
+            finally
+            {
+                _itemsLocker.ExitWriteLock();
+            }
+
+            OnPropertyChanged("Count");
+            OnPropertyChanged("Item[]");
+            OnCollectionReset();
+        }
+
+        public bool Contains(T item)
+        {
+            _itemsLocker.EnterReadLock();
+
+            try
+            {
+                return _items.Contains(item);
+            }
+            finally
+            {
+                _itemsLocker.ExitReadLock();
             }
         }
 
-        #endregion
+        public void CopyTo(T[] array, int index)
+        {
+            _itemsLocker.EnterReadLock();
+
+            try
+            {
+                _items.CopyTo(array, index);
+                if (addedToEvent != null)
+                {
+                    addedToEvent(this, new AddIntoEvent(index, array.Length));
+                }
+            }
+            finally
+            {
+                _itemsLocker.ExitReadLock();
+            }
+        }
+
+        public void Dispose()
+        {
+            _itemsLocker.Dispose();
+        }
+
+        public SynchronizedObservableCollectionEnumerator<T> GetEnumerator()
+        {
+            _itemsLocker.EnterReadLock();
+
+            try
+            {
+                return new SynchronizedObservableCollectionEnumerator<T>(this);
+            }
+            finally
+            {
+                _itemsLocker.ExitReadLock();
+            }
+        }
+
+        void ICollection.CopyTo(Array array, int index)
+        {
+            _itemsLocker.EnterReadLock();
+
+            try
+            {
+                if (array == null)
+                {
+                    throw new ArgumentNullException("array", "'array' cannot be null");
+                }
+
+                if (array.Rank != 1)
+                {
+                    throw new ArgumentException("Multi-dimension arrays are not supported", "array");
+                }
+
+                if (array.GetLowerBound(0) != 0)
+                {
+                    throw new ArgumentException("Non-zero lower bound arrays are not supported", "array");
+                }
+
+                if (index < 0)
+                {
+                    throw new ArgumentOutOfRangeException("index", "'index' is out of range");
+                }
+
+                if (array.Length - index < _items.Count)
+                {
+                    throw new ArgumentException("Array is too small");
+                }
+
+                var tArray = array as T[];
+                if (tArray != null)
+                {
+                    _items.CopyTo(tArray, index);
+                    if (addedToEvent != null)
+                    {
+                        addedToEvent(this, new AddIntoEvent(index, array.Length));
+                    }
+                }
+                else
+                {
+                    //
+                    // Catch the obvious case assignment will fail.
+                    // We can found all possible problems by doing the check though.
+                    // For example, if the element type of the Array is derived from T,
+                    // we can't figure out if we can successfully copy the element beforehand.
+                    //
+                    var targetType = array.GetType().GetElementType();
+                    var sourceType = typeof(T);
+                    if (!(targetType.IsAssignableFrom(sourceType) || sourceType.IsAssignableFrom(targetType)))
+                    {
+                        throw new ArrayTypeMismatchException("Invalid array type");
+                    }
+
+                    //
+                    // We can't cast array of value type to object[], so we don't support
+                    // widening of primitive types here.
+                    //
+                    var objects = array as object[];
+                    if (objects == null)
+                    {
+                        throw new ArrayTypeMismatchException("Invalid array type");
+                    }
+
+                    var count = _items.Count;
+                    try
+                    {
+                        for (var i = 0; i < count; i++)
+                        {
+                            objects[index++] = _items[i];
+                        }
+                    }
+                    catch (ArrayTypeMismatchException)
+                    {
+                        throw new ArrayTypeMismatchException("Invalid array type");
+                    }
+                }
+            }
+            finally
+            {
+                _itemsLocker.ExitReadLock();
+            }
+        }
+
+        IEnumerator IEnumerable.GetEnumerator()
+        {
+            _itemsLocker.EnterReadLock();
+
+            try
+            {
+                return (IEnumerator)new SynchronizedObservableCollectionEnumerator<T>(this);
+            }
+            finally
+            {
+                _itemsLocker.ExitReadLock();
+            }
+        }
+
+        IEnumerator<T> IEnumerable<T>.GetEnumerator()
+        {
+            return (IEnumerator<T>)GetEnumerator();
+        }
+
+        int IList.Add(object value)
+        {
+            _itemsLocker.EnterWriteLock();
+
+            var index = -1;
+            T item;
+
+            try
+            {
+                CheckIsReadOnly();
+                CheckReentrancy();
+
+                index = _items.Count;
+                item = (T)value;
+
+                _items.Insert(index, item);
+            }
+            catch (InvalidCastException)
+            {
+                throw new ArgumentException("'value' is the wrong type");
+            }
+            finally
+            {
+                _itemsLocker.ExitWriteLock();
+            }
+
+            OnPropertyChanged("Count");
+            OnPropertyChanged("Item[]");
+            OnCollectionChanged(NotifyCollectionChangedAction.Add, item, index);
+
+            return index;
+        }
+
+        bool IList.Contains(object value)
+        {
+            if (IsCompatibleObject(value))
+            {
+                _itemsLocker.EnterReadLock();
+
+                try
+                {
+                    return _items.Contains((T)value);
+                }
+                finally
+                {
+                    _itemsLocker.ExitReadLock();
+                }
+            }
+
+            return false;
+        }
+
+        int IList.IndexOf(object value)
+        {
+            if (IsCompatibleObject(value))
+            {
+                _itemsLocker.EnterReadLock();
+
+                try
+                {
+                    return _items.IndexOf((T)value);
+                }
+                finally
+                {
+                    _itemsLocker.ExitReadLock();
+                }
+            }
+
+            return -1;
+        }
+
+        void IList.Insert(int index, object value)
+        {
+            try
+            {
+                Insert(index, (T)value);
+                if (addedToEvent != null)
+                {
+                    addedToEvent(this, new AddIntoEvent(index, 1));
+                }
+            }
+            catch (InvalidCastException)
+            {
+                throw new ArgumentException("'value' is the wrong type");
+            }
+        }
+
+        void IList.Remove(object value)
+        {
+            if (IsCompatibleObject(value))
+            {
+                Remove((T)value);
+            }
+        }
+
+        public int IndexOf(T item)
+        {
+            _itemsLocker.EnterReadLock();
+
+            try
+            {
+                return _items.IndexOf(item);
+            }
+            finally
+            {
+                _itemsLocker.ExitReadLock();
+            }
+        }
+
+        public void Insert(int index, T item)
+        {
+            _itemsLocker.EnterWriteLock();
+
+            try
+            {
+                CheckIsReadOnly();
+                CheckIndex(index);
+                CheckReentrancy();
+
+                _items.Insert(index, item);
+                if (addedToEvent != null)
+                {
+                    addedToEvent(this, new AddIntoEvent(index, 1));
+                }
+            }
+            finally
+            {
+                _itemsLocker.ExitWriteLock();
+            }
+
+            OnPropertyChanged("Count");
+            OnPropertyChanged("Item[]");
+            OnCollectionChanged(NotifyCollectionChangedAction.Add, item, index);
+        }
+
+        public bool Remove(T item)
+        {
+            int index;
+            T value;
+
+            _itemsLocker.EnterWriteLock();
+
+            try
+            {
+                CheckIsReadOnly();
+                CheckReentrancy();
+
+                index = _items.IndexOf(item);
+
+                if (index < 0)
+                {
+                    return false;
+                }
+
+                value = _items[index];
+
+                _items.RemoveAt(index);
+                if (addedToEvent != null)
+                {
+                    addedToEvent(this, new AddIntoEvent(index, -1));
+                }
+            }
+            finally
+            {
+                _itemsLocker.ExitWriteLock();
+            }
+
+            OnPropertyChanged("Count");
+            OnPropertyChanged("Item[]");
+            OnCollectionChanged(NotifyCollectionChangedAction.Remove, value, index);
+
+            return true;
+        }
+
+        public void RemoveAt(int index)
+        {
+            T value;
+
+            _itemsLocker.EnterWriteLock();
+
+            try
+            {
+                CheckIsReadOnly();
+                CheckIndex(index);
+                CheckReentrancy();
+
+                value = _items[index];
+
+                _items.RemoveAt(index);
+                if (addedToEvent != null)
+                {
+                    addedToEvent(this, new AddIntoEvent(index, -1));
+                }
+            }
+            finally
+            {
+                _itemsLocker.ExitWriteLock();
+            }
+
+            OnPropertyChanged("Count");
+            OnPropertyChanged("Item[]");
+            OnCollectionChanged(NotifyCollectionChangedAction.Remove, value, index);
+        }
+
+        #endregion Public Methods
 
         #region Private Methods
+
+        private static bool IsCompatibleObject(object value)
+        {
+            // Non-null values are fine.  Only accept nulls if T is a class or Nullable<U>.
+            // Note that default(T) is not equal to null for value types except when T is Nullable<U>.
+            return ((value is T) || (value == null && default(T) == null));
+        }
+
         private IDisposable BlockReentrancy()
         {
             _monitor.Enter();
@@ -237,7 +681,7 @@ namespace CCSWE.Collections.ObjectModel
         {
             if (_items.IsReadOnly)
             {
-                throw new NotSupportedException("Collection is readonly");
+                throw new NotSupportedException("Collection is read-only");
             }
         }
 
@@ -247,18 +691,6 @@ namespace CCSWE.Collections.ObjectModel
             {
                 throw new InvalidOperationException("SynchronizedObservableCollection reentrancy not allowed");
             }
-        }
-
-        private static bool IsCompatibleObject(object value)
-        {
-            // Non-null values are fine.  Only accept nulls if T is a class or Nullable<U>.
-            // Note that default(T) is not equal to null for value types except when T is Nullable<U>. 
-            return ((value is T) || (value == null && default(T) == null));
-        }
-
-        private void OnPropertyChanged(string propertyName)
-        {
-            OnPropertyChanged(new PropertyChangedEventArgs(propertyName));
         }
 
         private void OnCollectionChanged(NotifyCollectionChangedAction action, object item, int index)
@@ -295,6 +727,11 @@ namespace CCSWE.Collections.ObjectModel
             OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
         }
 
+        private void OnPropertyChanged(string propertyName)
+        {
+            OnPropertyChanged(new PropertyChangedEventArgs(propertyName));
+        }
+
         private void OnPropertyChanged(PropertyChangedEventArgs e)
         {
             var propertyChanged = PropertyChanged;
@@ -305,394 +742,33 @@ namespace CCSWE.Collections.ObjectModel
 
             _context.Send(state => propertyChanged(this, e), null);
         }
-        #endregion
 
-        #region Public Methods
-        public void Add(T item)
-        {
-            _itemsLocker.EnterWriteLock();
+        #endregion Private Methods
 
-            var index = -1;
+        #region Private Classes
 
-            try
-            {
-                CheckIsReadOnly();
-                CheckReentrancy();
-
-                index = _items.Count;
-
-                _items.Insert(index, item);
-            }
-            finally
-            {
-                _itemsLocker.ExitWriteLock();
-            }
-
-            OnPropertyChanged("Count");
-            OnPropertyChanged("Item[]");
-            OnCollectionChanged(NotifyCollectionChangedAction.Add, item, index);
-        }
-
-        int IList.Add(object value)
-        {
-            _itemsLocker.EnterWriteLock();
-
-            var index = -1;
-            T item;
-
-            try
-            {
-                CheckIsReadOnly();
-                CheckReentrancy();
-
-                index = _items.Count; 
-                item = (T)value;
-
-                _items.Insert(index, item);
-            }
-            catch (InvalidCastException)
-            {
-                throw new ArgumentException("'value' is the wrong type");
-            }
-            finally
-            {
-                _itemsLocker.ExitWriteLock();
-            }
-
-            OnPropertyChanged("Count");
-            OnPropertyChanged("Item[]");
-            OnCollectionChanged(NotifyCollectionChangedAction.Add, item, index);
-
-            return index;
-        }
-
-        public void Clear()
-        {
-            _itemsLocker.EnterWriteLock();
-
-            try
-            {
-                CheckIsReadOnly();
-                CheckReentrancy();
-
-                _items.Clear();
-            }
-            finally
-            {
-                _itemsLocker.ExitWriteLock();
-            }
-
-            OnPropertyChanged("Count");
-            OnPropertyChanged("Item[]");
-            OnCollectionReset();
-        }
-
-        public void CopyTo(T[] array, int index)
-        {
-            _itemsLocker.EnterReadLock();
-
-            try
-            {
-                _items.CopyTo(array, index);
-            }
-            finally
-            {
-                _itemsLocker.ExitReadLock();
-            }
-        }
-
-        void ICollection.CopyTo(Array array, int index)
-        {
-            _itemsLocker.EnterReadLock();
-
-            try
-            {
-                if (array == null)
-                {
-                    throw new ArgumentNullException("array", "'array' cannot be null");
-                }
-
-                if (array.Rank != 1)
-                {
-                    throw new ArgumentException("Multidimension arrays are not supported", "array");
-                }
-
-                if (array.GetLowerBound(0) != 0)
-                {
-                    throw new ArgumentException("Non-zero lower bound arrays are not supported", "array");
-                }
-
-                if (index < 0)
-                {
-                    throw new ArgumentOutOfRangeException("index", "'index' is out of range");
-                }
-
-                if (array.Length - index < _items.Count)
-                {
-                    throw new ArgumentException("Array is too small");
-                }
-
-                var tArray = array as T[];
-                if (tArray != null)
-                {
-                    _items.CopyTo(tArray, index);
-                }
-                else
-                {
-                    //
-                    // Catch the obvious case assignment will fail.
-                    // We can found all possible problems by doing the check though.
-                    // For example, if the element type of the Array is derived from T,
-                    // we can't figure out if we can successfully copy the element beforehand.
-                    //
-                    var targetType = array.GetType().GetElementType();
-                    var sourceType = typeof (T);
-                    if (!(targetType.IsAssignableFrom(sourceType) || sourceType.IsAssignableFrom(targetType)))
-                    {
-                        throw new ArrayTypeMismatchException("Invalid array type");
-                    }
-
-                    //
-                    // We can't cast array of value type to object[], so we don't support 
-                    // widening of primitive types here.
-                    //
-                    var objects = array as object[];
-                    if (objects == null)
-                    {
-                        throw new ArrayTypeMismatchException("Invalid array type");
-                    }
-
-                    var count = _items.Count;
-                    try
-                    {
-                        for (var i = 0; i < count; i++)
-                        {
-                            objects[index++] = _items[i];
-                        }
-                    }
-                    catch (ArrayTypeMismatchException)
-                    {
-                        throw new ArrayTypeMismatchException("Invalid array type");
-                    }
-                }
-            }
-            finally
-            {
-                _itemsLocker.ExitReadLock();
-            }
-        }
-
-        public bool Contains(T item)
-        {
-            _itemsLocker.EnterReadLock();
-
-            try
-            {
-                return _items.Contains(item);
-            }
-            finally
-            {
-                _itemsLocker.ExitReadLock();
-            }
-        }
-
-        bool IList.Contains(object value)
-        {
-            if (IsCompatibleObject(value))
-            {
-                _itemsLocker.EnterReadLock();
-
-                try
-                {
-                    return _items.Contains((T) value);
-                }
-                finally
-                {
-                    _itemsLocker.ExitReadLock();
-                }
-            }
-
-            return false;
-        }
-
-        public void Dispose()
-        {
-            _itemsLocker.Dispose();
-        }
-
-        public IEnumerator<T> GetEnumerator()
-        {
-            _itemsLocker.EnterReadLock();
-
-            try
-            {
-                return _items.ToList().GetEnumerator();
-            }
-            finally
-            {
-                _itemsLocker.ExitReadLock();
-            }
-        }
-
-        IEnumerator IEnumerable.GetEnumerator()
-        {
-            _itemsLocker.EnterReadLock();
-
-            try
-            {
-                return ((IEnumerable) _items.ToList()).GetEnumerator();
-            }
-            finally
-            {
-                _itemsLocker.ExitReadLock();
-            }
-        }
-
-        public int IndexOf(T item)
-        {
-            _itemsLocker.EnterReadLock();
-
-            try
-            {
-                return _items.IndexOf(item);
-            }
-            finally
-            {
-                _itemsLocker.ExitReadLock();
-            }
-        }
-
-        int IList.IndexOf(object value)
-        {
-            if (IsCompatibleObject(value))
-            {
-                _itemsLocker.EnterReadLock();
-
-                try
-                {
-                    return _items.IndexOf((T) value);
-                }
-                finally
-                {
-                    _itemsLocker.ExitReadLock();
-                }
-            }
-
-            return -1;
-        }
-
-        public void Insert(int index, T item)
-        {
-            _itemsLocker.EnterWriteLock();
-
-            try
-            {
-                CheckIsReadOnly();
-                CheckIndex(index);
-                CheckReentrancy();
-
-                _items.Insert(index, item);
-            }
-            finally
-            {
-                _itemsLocker.ExitWriteLock();
-            }
-
-            OnPropertyChanged("Count");
-            OnPropertyChanged("Item[]");
-            OnCollectionChanged(NotifyCollectionChangedAction.Add, item, index);
-        }
-
-        void IList.Insert(int index, object value)
-        {
-            try
-            {
-                Insert(index, (T) value);
-            }
-            catch (InvalidCastException)
-            {
-                throw new ArgumentException("'value' is the wrong type");
-            }
-        }
-
-        public bool Remove(T item)
-        {
-            int index;
-            T value;
-
-            _itemsLocker.EnterWriteLock();
-
-            try
-            {
-                CheckIsReadOnly();
-                CheckReentrancy();
-
-                index = _items.IndexOf(item);
-
-                if (index < 0)
-                {
-                    return false;
-                }
-
-                value = _items[index];
-
-                _items.RemoveAt(index);
-            }
-            finally
-            {
-                _itemsLocker.ExitWriteLock();
-            }
-
-            OnPropertyChanged("Count");
-            OnPropertyChanged("Item[]");
-            OnCollectionChanged(NotifyCollectionChangedAction.Remove, value, index);
-
-            return true;
-        }
-
-        void IList.Remove(object value)
-        {
-            if (IsCompatibleObject(value))
-            {
-                Remove((T) value);
-            }
-        }
-
-        public void RemoveAt(int index)
-        {
-            T value;
-
-            _itemsLocker.EnterWriteLock();
-
-            try
-            {
-                CheckIsReadOnly();
-                CheckIndex(index);
-                CheckReentrancy();
-
-                value = _items[index];
-
-                _items.RemoveAt(index);
-            }
-            finally
-            {
-                _itemsLocker.ExitWriteLock();
-            }
-
-            OnPropertyChanged("Count");
-            OnPropertyChanged("Item[]");
-            OnCollectionChanged(NotifyCollectionChangedAction.Remove, value, index);
-        }
-        #endregion
-
-        #region SimpleMonitor Class
         private class SimpleMonitor : IDisposable
         {
+            #region Private Fields
+
             private int _busyCount;
+
+            #endregion Private Fields
+
+            #region Public Properties
 
             public bool Busy
             {
                 get { return _busyCount > 0; }
+            }
+
+            #endregion Public Properties
+
+            #region Public Methods
+
+            public void Dispose()
+            {
+                --_busyCount;
             }
 
             public void Enter()
@@ -700,11 +776,241 @@ namespace CCSWE.Collections.ObjectModel
                 ++_busyCount;
             }
 
-            public void Dispose()
+            #endregion Public Methods
+        }
+
+        #endregion Private Classes
+    }
+
+    /// <summary>
+    /// Class that enumerates over the <see cref="SynchronizedObservableCollection"/> class.
+    /// Forward only enumeration guarantied to not output duplicates if items are added before current location.
+    /// </summary>
+    /// <typeparam name="T">The type that the collection is holding.</typeparam>
+    public class SynchronizedObservableCollectionEnumerator<T> : IEnumerator<T>, IEnumerator
+    {
+        private ReaderWriterLockSlim _positionLock = new ReaderWriterLockSlim();
+        private addIntoEventHandler eHandler;
+        public void collectionChanged(object source, AddIntoEvent e)
+        {
+            _positionLock.EnterWriteLock();
+            try
             {
-                --_busyCount;
+                if (e.startIndex < position)
+                {
+                    position += e.numberAdded;
+                }
+            }
+            finally
+            {
+                _positionLock.ExitWriteLock();
             }
         }
-        #endregion
+        #region Public Fields
+
+        /// <summary>
+        /// The collection that is being enumerated
+        /// </summary>
+        public SynchronizedObservableCollection<T> syncedObsCol;
+
+        #endregion Public Fields
+
+        #region Private Fields
+
+        /// <summary>
+        /// weather this enumerator is already disposed
+        /// </summary>
+        private bool disposed = false;
+
+        /// <summary>
+        /// The position of the enumeration
+        /// </summary>
+        private int position = -1;
+
+        #endregion Private Fields
+
+        #region Public Constructors
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="SynchronizedObservableCollectionEnumerator{T}"/> class.
+        /// </summary>
+        /// <param name="cols">The collection to enumerate over.</param>
+        public SynchronizedObservableCollectionEnumerator(SynchronizedObservableCollection<T> cols)
+        {
+            syncedObsCol = cols;
+            this.eHandler = new addIntoEventHandler(collectionChanged);
+            cols.addedToEvent += this.eHandler;
+        }
+
+        #endregion Public Constructors
+
+        #region Public Properties
+
+        /// <summary>
+        /// Gets the element in the collection at the current position of the enumerator.
+        /// </summary>
+        public T Current
+        {
+            get
+            {
+                return getCurrent();
+            }
+        }
+
+        /// <summary>
+        /// Gets the element in the collection at the current position of the enumerator.
+        /// </summary>
+        object IEnumerator.Current
+        {
+            get { return getCurrent(); }
+        }
+
+        #endregion Public Properties
+
+        #region Public Methods
+
+        /// <summary>
+        /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
+        /// </summary>
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Advances the enumerator to the next element of the collection.
+        /// </summary>
+        /// <returns>
+        /// true if the enumerator was successfully advanced to the next element; false if the enumerator has passed the end of the collection.
+        /// </returns>
+        public bool MoveNext()
+        {
+            _positionLock.EnterWriteLock();
+            try
+            {
+                position++;
+                return position < syncedObsCol.Count;
+            }
+            finally
+            {
+                _positionLock.ExitWriteLock();
+            }
+        }
+
+        /// <summary>
+        /// Sets the enumerator to its initial position, which is before the first element in the collection.
+        /// </summary>
+        public void Reset()
+        {
+            _positionLock.EnterWriteLock();
+            try
+            {
+                position = -1;
+            }
+            finally
+            {
+                _positionLock.ExitWriteLock();
+            }
+        }
+
+        #endregion Public Methods
+
+        #region Protected Methods
+
+        /// <summary>
+        /// Releases unmanaged and - optionally - managed resources.
+        /// </summary>
+        /// <param name="disposing"><c>true</c> to release both managed and unmanaged resources; <c>false</c> to release only unmanaged resources.</param>
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!this.disposed)
+            {
+                if (disposing)
+                {
+                    //set the pointer to null so that the GC can get it. we
+                    //don't want actually dispose of the object in case it is
+                    //still being used elsewhere.
+                    syncedObsCol.addedToEvent -= this.eHandler;
+                    syncedObsCol = null;
+                }
+            }
+            this.disposed = true;
+        }
+
+        #endregion Protected Methods
+
+        #region Private Methods
+
+        /// <summary>
+        /// Gets the current value.
+        /// </summary>
+        /// <returns>The current value.</returns>
+        private T getCurrent()
+        {
+            _positionLock.EnterReadLock();
+            try
+            {
+                return syncedObsCol.ElementAt(position);
+            }
+            finally
+            {
+                _positionLock.ExitReadLock();
+            }
+        }
+
+        #endregion Private Methods
+    }
+
+    public class AddIntoEvent : EventArgs
+    {
+        public AddIntoEvent(int startIndex, int numberAdded)
+        {
+            this.startIndex = startIndex;
+            this.numberAdded = numberAdded;
+        }
+        /// <summary>
+        /// The start index storage object
+        /// </summary>
+        private int _startIndex;
+        /// <summary>
+        /// The number added object
+        /// </summary>
+        private int _numberAdded;
+        /// <summary>
+        /// Gets or sets the start index.
+        /// </summary>
+        /// <value>
+        /// The start index.
+        /// </value>
+        public int startIndex
+        {
+            get
+            {
+                return _startIndex;
+            }
+            set
+            {
+                _startIndex = value;
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the number added.
+        /// </summary>
+        /// <value>
+        /// The number added.
+        /// </value>
+        public int numberAdded
+        {
+            get
+            {
+                return _numberAdded;
+            }
+            set
+            {
+                _numberAdded = value;
+            }
+        }
     }
 }
